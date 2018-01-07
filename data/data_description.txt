@@ -1,4 +1,4 @@
-Id: [x] Identifies the example.
+Id: [out] Identifies the example.
 
 MSSubClass: [cat] Identifies the type of dwelling involved in the sale.
 
@@ -538,4 +538,4 @@ SaleCondition: [cat] Condition of sale
        Family	Sale between family members
        Partial	Home was not completed when last assessed (associated with New Homes)
 
-SalePrice: [out] Final sale price (output).
+SalePrice: [x] Final sale price (output).
