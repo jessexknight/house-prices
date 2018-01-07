@@ -1,4 +1,5 @@
 import re
+import copy
 import tempfile
 import pandas as pd
 import numpy  as np
@@ -45,7 +46,7 @@ def load_data(datafile):
            'cat': [c for c in cols if dtypes[c] in ['cat']]}
   # feature columns (symbolic)
   fcols = {'cts': {k: tf.feature_column.numeric_column(k)
-                  for k in names['out']}, # dummy fit
+                  for k in names['cts']},
            'ord': {k: []
                   for k in names['ord']},
            'cat': {k: []
@@ -68,8 +69,7 @@ def load_data(datafile):
                values=[1 for v in df[k].values],
                dense_shape=[df[k].shape[0],len(dtypes[c])])
              for k in [c for c in cols if dtypes[c] in ['cat']]}}
-  x  = cols['out']
-  # x  = merge(cols['out'], cols['cts'])#, cols_ord)# + cols_cat)
+  x  = merge(cols['out'], cols['cts'])#, cols_ord)# + cols_cat)
   fx = fcols['cts'].values()
   return x,fx,names
 
@@ -78,28 +78,36 @@ def input_fn(x,outname):
   dataset.batch(128)
   iterator = dataset.make_one_shot_iterator()
   xi = iterator.get_next()
-  # yi = xi.pop(outname) # real
-  yi = xi[outname] # dummy fit
+  yi = xi.pop(outname)
   return xi,yi
+
+# def pred_fn(x,outname):
+#   yp = x[outname]
+#   xp = {k:v.eval() for k,v in x.iteritems() if k is not outname}
+#   return xp,yp
 
 if __name__ == '__main__':
   tf.reset_default_graph()
   sess = tf.InteractiveSession()
   x,fx,names = load_data('data/train.csv')
   input_fn_train = lambda: input_fn(x,names['out'][0])
+  input_fn_pred  = tf.estimator.inputs.numpy_input_fn(
+    {k:v.eval() for k,v in x.iteritems() if k is not names['out'][0]},
+    num_epochs=1,shuffle=False)
   optimizer = tf.train.ProximalAdagradOptimizer(
-    learning_rate = 0.5,
+    learning_rate = 0.1,
     l1_regularization_strength=0.0001)
-  model = tf.estimator.DNNRegressor(hidden_units=[5],
+  model = tf.estimator.DNNRegressor(hidden_units=[16,16],
                                     feature_columns=fx,
                                     # optimizer=optimizer,
                                     model_dir=tempfile.mkdtemp())
-  for e in range(10):
-    for i in range(1):
+  for e in range(100):
+    for i in range(10):
       model.train(input_fn=input_fn_train)
     results = model.evaluate(input_fn=input_fn_train)
-    # print '['+str(e+1).zfill(4)+']\tJ = '+str(results['average_loss'])
-    predict = model.predict(input_fn=input_fn_train)
+    print '['+str(e+1).zfill(4)+']\tJ = '+str(results['average_loss'])
+    predict = list(model.predict(input_fn=input_fn_pred))
     for i in range(0,10):
-      print str(x['Id'][i].eval())+' -> '+str(predict.next()['predictions'][0])
+      print str(x[names['out'][0]][i].eval())+' -> '\
+           +str(predict[i]['predictions'][0])
   sess.close()
