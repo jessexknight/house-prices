@@ -1,4 +1,5 @@
 import re
+import csv
 import copy
 import tempfile
 import pandas as pd
@@ -27,14 +28,6 @@ def get_cols():
               for colfmt in colfmts}
   return cols,dtypes,cats
 
-def predict(model,outfile=None):
-  # load the test data
-  xt,_,names = load_data('data/test.csv')
-  input_fn_test = lambda: input_fn(xt,names['out'][0])
-  # compute the test loss
-  results = model.evaluate(input_fn_test)
-  print '[test]\tJ = '+str(results['average_loss'])
-
 def load_data(datafile):
   cols,dtypes,cats = get_cols()
   df = pd.read_csv(datafile,names=[c for c in cols],skiprows=1,dtype=str)
@@ -44,10 +37,13 @@ def load_data(datafile):
            'cts': [c for c in cols if dtypes[c] in ['rv','iv']],
            'ord': [c for c in cols if dtypes[c] in ['ord']],
            'cat': [c for c in cols if dtypes[c] in ['cat']]}
+  # some meta-data
+  meta  = {'len': df.shape[0],
+           'Id':  df['Id'].values}
   # feature columns (symbolic)
   fcols = {'cts': {k: tf.feature_column.numeric_column(k)
                   for k in names['cts']},
-           'ord': {k: []
+           'ord': {k: tf.feature_column.numeric_column(k)
                   for k in names['ord']},
            'cat': {k: []
                   for k in names['cat']}}
@@ -61,7 +57,7 @@ def load_data(datafile):
           'cts': {k: tf.constant([nanfix(float(v),0)
              for v in df[k].values])
              for k in names['cts']},
-          'ord': {k: tf.constant([float(cats[k].index(v)) # FIX
+          'ord': {k: tf.constant([float(cats[k].index(v))
              for v in df[k].values])
              for k in [c for c in cols if dtypes[c] in ['ord']]},
           'cat': {k: tf.SparseTensor( # FIX
@@ -69,45 +65,64 @@ def load_data(datafile):
                values=[1 for v in df[k].values],
                dense_shape=[df[k].shape[0],len(dtypes[c])])
              for k in [c for c in cols if dtypes[c] in ['cat']]}}
-  x  = merge(cols['out'], cols['cts'])#, cols_ord)# + cols_cat)
-  fx = fcols['cts'].values()
-  return x,fx,names
+  x  = merge(cols['out'], cols['cts'], cols['ord'])# + cols_cat)
+  fx = fcols['cts'].values()+fcols['ord'].values()
+  return x,fx,meta,names
 
-def input_fn(x,outname):
+def input_fn(x,outname,batchsize=128):
   dataset = tf.data.Dataset.from_tensors(x)
-  dataset.batch(128)
+  dataset.shuffle(buffer_size=batch_size)
+  dataset.batch(batchsize)
   iterator = dataset.make_one_shot_iterator()
   xi = iterator.get_next()
   yi = xi.pop(outname)
   return xi,yi
 
-# def pred_fn(x,outname):
-#   yp = x[outname]
-#   xp = {k:v.eval() for k,v in x.iteritems() if k is not outname}
-#   return xp,yp
-
 if __name__ == '__main__':
+  # hyperparameters
+  learning_rate = 0.1
+  l1_lambda     = 0.001
+  l2_lambda     = 0.001
+  batch_size    = 128
+  # init tf session
   tf.reset_default_graph()
   sess = tf.InteractiveSession()
-  x,fx,names = load_data('data/train.csv')
+  # load data
+  x,fx,meta,names = load_data('data/train.csv')
+  # define training and prediction functions
   input_fn_train = lambda: input_fn(x,names['out'][0])
-  input_fn_pred  = tf.estimator.inputs.numpy_input_fn(
+  input_fn_valid = tf.estimator.inputs.numpy_input_fn(
     {k:v.eval() for k,v in x.iteritems() if k is not names['out'][0]},
     num_epochs=1,shuffle=False)
+  # define the optimizer and model
   optimizer = tf.train.ProximalAdagradOptimizer(
-    learning_rate = 0.1,
-    l1_regularization_strength=0.0001)
-  model = tf.estimator.DNNRegressor(hidden_units=[16,16],
+    learning_rate = learning_rate,
+    l1_regularization_strength=l1_lambda,
+    l2_regularization_strength=l2_lambda)
+  model = tf.estimator.DNNRegressor(hidden_units=[64,64],
                                     feature_columns=fx,
-                                    # optimizer=optimizer,
+                                    optimizer=optimizer,
                                     model_dir=tempfile.mkdtemp())
+  # train the model
   for e in range(100):
-    for i in range(10):
+    for i in range(int(meta['len']/batch_size)):
       model.train(input_fn=input_fn_train)
     results = model.evaluate(input_fn=input_fn_train)
-    print '['+str(e+1).zfill(4)+']\tJ = '+str(results['average_loss'])
-    predict = list(model.predict(input_fn=input_fn_pred))
+    print '\n['+str(e+1).zfill(4)+'] '+\
+          'J: '+str(int(np.sqrt(results['average_loss']))).zfill(6)
+    predictions = list(model.predict(input_fn=input_fn_valid))
     for i in range(0,10):
-      print str(x[names['out'][0]][i].eval())+' -> '\
-           +str(predict[i]['predictions'][0])
+      print str(int(x[names['out'][0]][i].eval()))+' -> '\
+           +str(int(predictions[i]['predictions'][0]))
+  # predict the test data
+  xt,_,meta,_ = load_data('data/test.csv')
+  input_fn_test = tf.estimator.inputs.numpy_input_fn(
+    {k:v.eval() for k,v in xt.iteritems() if k is not names['out'][0]},
+    num_epochs=1,shuffle=False)
+  predictions = list(model.predict(input_fn=input_fn_test))
+  output      = pd.DataFrame(
+                  {'Id'       : meta['Id'],
+                   'SalePrice': [p['predictions'][0] for p in predictions]})
+  with open('data/out.csv','w') as outfile:
+    output.to_csv(outfile,index=False)
   sess.close()
