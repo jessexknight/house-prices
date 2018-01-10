@@ -1,128 +1,95 @@
-import re
-import csv
-import copy
-import tempfile
-import pandas as pd
-import numpy  as np
 import tensorflow as tf
+import numpy as np
+import pandas as pd
+import itertools
+import data
+import os
 
-def merge(d0,*args):
-  d = d0.copy()
-  for arg in args:
-    d.update(arg)
-  return d
+def get_data(datafile,train=True):
 
-def nanfix(x,fill=0):
-  return np.asscalar(np.where(np.isnan(x),fill,x))
+  def nanfix(x,fill=0):
+    return np.asscalar(np.where(np.isnan(float(x)),fill,float(x)))
 
-def get_cols():
-  refmt = '(?:\A|\n)([^\s]*):.*\[(.*)\].*\n((?:\n.*\t.*)*|)'
-  recat = '(?:\n(.*)\t.*)'
-  with open('data/data_description.txt','r') as fmtfile:
-    colfmts = re.findall(refmt,fmtfile.read())
-    cols   = [colfmt[0] for colfmt in colfmts]
-    dtypes = {colfmt[0]:colfmt[1] for colfmt in colfmts}
-    cats   = {colfmt[0]:[cat.strip()
-              for cat in re.findall(recat,colfmt[2])
-              if cat.strip() is not 'NA']+['nan']
-              for colfmt in colfmts}
-  return cols,dtypes,cats
-
-def load_data(datafile):
-  cols,dtypes,cats = get_cols()
-  df = pd.read_csv(datafile,names=[c for c in cols],skiprows=1,dtype=str)
+  feats = data.names()
+  cats  = data.cats()
+  df = pd.read_csv(datafile,dtype=str)
   df.fillna('nan',inplace=True)
-  names = {'id':  [c for c in cols if dtypes[c] in ['id']],
-           'out': [c for c in cols if dtypes[c] in ['out']],
-           'cts': [c for c in cols if dtypes[c] in ['rv','iv']],
-           'ord': [c for c in cols if dtypes[c] in ['ord']],
-           'cat': [c for c in cols if dtypes[c] in ['cat']]}
-  # some meta-data
-  meta  = {'len': df.shape[0],
-           'Id':  df['Id'].values}
-  # feature columns (symbolic)
-  fcols = {'cts': {k: tf.feature_column.numeric_column(k)
-                  for k in names['cts']},
-           'ord': {k: tf.feature_column.numeric_column(k)
-                  for k in names['ord']},
-           'cat': {k: []
-                  for k in names['cat']}}
-  # tensors (data)
-  cols = {'id':  {k: tf.constant([nanfix(float(v),0)
-             for v in df[k].values])
-             for k in names['out']},
-          'out': {k: tf.constant([nanfix(float(v),0)
-             for v in df[k].values])
-             for k in names['out']},
-          'cts': {k: tf.constant([nanfix(float(v),0)
-             for v in df[k].values])
-             for k in names['cts']},
-          'ord': {k: tf.constant([float(cats[k].index(v))
-             for v in df[k].values])
-             for k in [c for c in cols if dtypes[c] in ['ord']]},
-          'cat': {k: tf.SparseTensor( # FIX
-               indices=[[i,0] for i in [cats[k].index(v) for v in df[k].values]],
-               values=[1 for v in df[k].values],
-               dense_shape=[df[k].shape[0],len(dtypes[c])])
-             for k in [c for c in cols if dtypes[c] in ['cat']]}}
-  x  = merge(cols['out'], cols['cts'], cols['ord'])# + cols_cat)
-  fx = fcols['cts'].values()+fcols['ord'].values()
-  return x,fx,meta,names
+  df = df.apply(lambda x: x.astype(str).str.lower())
 
-def input_fn(x,outname,batchsize=128):
-  dataset = tf.data.Dataset.from_tensors(x)
-  dataset.shuffle(buffer_size=batch_size)
-  dataset.batch(batchsize)
-  iterator = dataset.make_one_shot_iterator()
-  xi = iterator.get_next()
-  yi = xi.pop(outname)
-  return xi,yi
+  X  = [[nanfix(x,0)
+         for x in df[c].values]  for c in feats['cts']]\
+     + [[float(cats[c].index(x))
+         for x in df[c].values]  for c in feats['ord']]\
+     + np.transpose(np.concatenate([np.eye(len(cats[c]))[[cats[c].index(x)
+         for x in df[c].values]] for c in feats['cat']],axis=1)).tolist()
+  tX = np.transpose(X)
+  if train:
+    tY = np.transpose([[nanfix(y,0) for y in df[c].values] for c in feats['out']])
+  else:
+    tY = []
+  tid = df[feats['id']]
+  return tX,tY,tid
 
-if __name__ == '__main__':
-  # hyperparameters
-  learning_rate = 0.1
-  l1_lambda     = 0.001
-  l2_lambda     = 0.001
-  batch_size    = 128
-  # init tf session
-  tf.reset_default_graph()
-  sess = tf.InteractiveSession()
-  # load data
-  x,fx,meta,names = load_data('data/train.csv')
-  # define training and prediction functions
-  input_fn_train = lambda: input_fn(x,names['out'][0])
-  input_fn_valid = tf.estimator.inputs.numpy_input_fn(
-    {k:v.eval() for k,v in x.iteritems() if k is not names['out'][0]},
-    num_epochs=1,shuffle=False)
-  # define the optimizer and model
-  optimizer = tf.train.ProximalAdagradOptimizer(
-    learning_rate = learning_rate,
-    l1_regularization_strength=l1_lambda,
-    l2_regularization_strength=l2_lambda)
-  model = tf.estimator.DNNRegressor(hidden_units=[64,64],
-                                    feature_columns=fx,
-                                    optimizer=optimizer,
-                                    model_dir=tempfile.mkdtemp())
-  # train the model
-  for e in range(100):
-    for i in range(int(meta['len']/batch_size)):
-      model.train(input_fn=input_fn_train)
-    results = model.evaluate(input_fn=input_fn_train)
-    print '\n['+str(e+1).zfill(4)+'] '+\
-          'J: '+str(int(np.sqrt(results['average_loss']))).zfill(6)
-    predictions = list(model.predict(input_fn=input_fn_valid))
-    for i in range(0,10):
-      print str(int(x[names['out'][0]][i].eval()))+' -> '\
-           +str(int(predictions[i]['predictions'][0]))
+def init_weights(shape):
+  return tf.Variable(tf.random_normal(shape, stddev=np.sqrt(2.0/shape[0])))
+
+def model(X, W):
+  h = X
+  for wi in W[:-1]:
+    h = tf.nn.relu(tf.matmul(h, wi))
+  return tf.matmul(h,W[-1])
+
+# initialization
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+tf.reset_default_graph()
+
+# load the data
+trX,trY,trId = get_data('data/train.csv')
+teX,teY,teId = get_data('data/test.csv',train=False)
+
+# define the parameters
+size_in  = trX.shape[1]
+size_out = trY.shape[1]
+size_h   = [size_in,128,32,size_out]
+batch_size = 128
+
+# define tf variables
+X  = tf.placeholder("float", [None, size_in])
+Y  = tf.placeholder("float", [None, size_out])
+W  = [init_weights([hi,ho]) for hi,ho in zip(size_h[:-1],size_h[1:])]
+
+# define the model & operations
+Yp = model(X, W)
+cost       = tf.reduce_mean(tf.pow(Yp-Y, 2.))
+optimizer  = tf.train.ProximalAdagradOptimizer(
+                learning_rate = 0.05,
+                l1_regularization_strength = 0.0001,
+                l2_regularization_strength = 0.0001)
+grads      = optimizer.compute_gradients(cost,W)
+train_op   = optimizer.minimize(cost)
+predict_op = Yp
+
+# Launch the graph in a session
+with tf.Session() as sess:
+  tf.global_variables_initializer().run()
+
+  for i in range(5000):
+    #print W[0][0][0].eval(session=sess) # weight
+    #print sess.run([grad for grad,_ in grads] ,feed_dict={X: trX, Y: trY}) # gradient
+    for start, end in zip(range(0, len(trX), batch_size),
+                          range(batch_size, len(trX)+1, batch_size)):
+      sess.run(train_op, feed_dict={X: trX[start:end], Y: trY[start:end]})
+    print str(i+1).rjust(5)+': '\
+         +str(int(np.mean([abs(y-yp) for y,yp in
+          zip(trY,sess.run(predict_op, feed_dict={X: trX}))]))).rjust(9)
+         # +str(trY[0][0]).rjust(9)+' vs '\
+         # +str(sess.run(predict_op, feed_dict={X: trX})[0][0]).rjust(9)
+
   # predict the test data
-  xt,_,meta,_ = load_data('data/test.csv')
-  input_fn_test = tf.estimator.inputs.numpy_input_fn(
-    {k:v.eval() for k,v in xt.iteritems() if k is not names['out'][0]},
-    num_epochs=1,shuffle=False)
-  predictions = list(model.predict(input_fn=input_fn_test))
+  predictions = sess.run(predict_op, feed_dict={X: teX})
   output      = pd.DataFrame(
-                  {'Id'       : meta['Id'],
-                   'SalePrice': [p['predictions'][0] for p in predictions]})
-  with open('data/out.csv','w') as outfile:
+                  {'Id'       : [v[0] for v in teId.values],
+                   'SalePrice': [v[0] for v in predictions]})
+  # write submission
+  with open('data/tmp.csv','w') as outfile:
     output.to_csv(outfile,index=False)
-  sess.close()

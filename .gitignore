@@ -1,2 +1,6 @@
+old/*
 *.csv
+*.pyc
 tmp*
+*MNIST*
+*mnist*
