@@ -1,11 +1,12 @@
+from sklearn.model_selection import train_test_split as tsplit
 import tensorflow as tf
 import numpy as np
 import pandas as pd
-import itertools
+import shutil
 import data
 import os
 
-def get_data(datafile,train=True):
+def get_data(datafile,loady=True):
 
   def nanfix(x,fill=0):
     return np.asscalar(np.where(np.isnan(float(x)),fill,float(x)))
@@ -23,7 +24,7 @@ def get_data(datafile,train=True):
      + np.transpose(np.concatenate([np.eye(len(cats[c]))[[cats[c].index(x)
          for x in df[c].values]] for c in feats['cat']],axis=1)).tolist()
   tX = np.transpose(X)
-  if train:
+  if loady:
     tY = np.transpose([[nanfix(y,0) for y in df[c].values] for c in feats['out']])
   else:
     tY = []
@@ -33,7 +34,7 @@ def get_data(datafile,train=True):
 def init_weights(shape):
   return tf.Variable(tf.random_normal(shape, stddev=np.sqrt(2.0/shape[0])))
 
-def model(X, W):
+def build_model(X, W):
   h = X
   for wi in W[:-1]:
     h = tf.nn.relu(tf.matmul(h, wi))
@@ -41,49 +42,55 @@ def model(X, W):
 
 # initialization
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+shutil.rmtree('log',ignore_errors=True)
 tf.reset_default_graph()
 
 # load the data
 trX,trY,trId = get_data('data/train.csv')
-teX,teY,teId = get_data('data/test.csv',train=False)
+teX,teY,teId = get_data('data/test.csv',loady=False)
+trX,vaX,trY,vaY,trId,vaId = tsplit(trX,trY,trId,test_size=0.25)
 
 # define the parameters
 size_in  = trX.shape[1]
 size_out = trY.shape[1]
-size_h   = [size_in,128,32,size_out]
+size_h   = [size_in,256,128,size_out]
 batch_size = 128
 
-# define tf variables
+# define tf symbolic variables
 X  = tf.placeholder("float", [None, size_in])
 Y  = tf.placeholder("float", [None, size_out])
 W  = [init_weights([hi,ho]) for hi,ho in zip(size_h[:-1],size_h[1:])]
 
 # define the model & operations
-Yp = model(X, W)
-cost       = tf.reduce_mean(tf.pow(Yp-Y, 2.))
+Yp         = build_model(X, W)
+objective  = tf.reduce_mean(tf.pow(Yp-Y, 2.))
 optimizer  = tf.train.ProximalAdagradOptimizer(
-                learning_rate = 0.05,
-                l1_regularization_strength = 0.0001,
-                l2_regularization_strength = 0.0001)
-grads      = optimizer.compute_gradients(cost,W)
-train_op   = optimizer.minimize(cost)
+                learning_rate = 0.001,
+                l1_regularization_strength = 0.01,
+                l2_regularization_strength = 0.01)
+train_op   = optimizer.minimize(objective)
 predict_op = Yp
+
+# tensorboard
+writer = {}
+writer.update({'tr':tf.summary.FileWriter('./log/tr')})
+writer.update({'va':tf.summary.FileWriter('./log/va')})
+tf.summary.scalar('Objective',  objective)
+summary = tf.summary.merge_all()
 
 # Launch the graph in a session
 with tf.Session() as sess:
   tf.global_variables_initializer().run()
 
-  for i in range(5000):
-    #print W[0][0][0].eval(session=sess) # weight
-    #print sess.run([grad for grad,_ in grads] ,feed_dict={X: trX, Y: trY}) # gradient
+  for e in range(10000):
     for start, end in zip(range(0, len(trX), batch_size),
                           range(batch_size, len(trX)+1, batch_size)):
       sess.run(train_op, feed_dict={X: trX[start:end], Y: trY[start:end]})
-    print str(i+1).rjust(5)+': '\
-         +str(int(np.mean([abs(y-yp) for y,yp in
-          zip(trY,sess.run(predict_op, feed_dict={X: trX}))]))).rjust(9)
-         # +str(trY[0][0]).rjust(9)+' vs '\
-         # +str(sess.run(predict_op, feed_dict={X: trX})[0][0]).rjust(9)
+    writer['tr'].add_summary(sess.run(summary,feed_dict={X:trX,Y:trY}),e)
+    writer['tr'].flush()
+    writer['va'].add_summary(sess.run(summary,feed_dict={X:vaX,Y:vaY}),e)
+    writer['va'].flush()
+    print str(e).rjust(5)
 
   # predict the test data
   predictions = sess.run(predict_op, feed_dict={X: teX})
